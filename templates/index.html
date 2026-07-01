@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Provenance Guard</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; color: #222; }
+  textarea { width: 100%; height: 140px; font-family: inherit; font-size: 14px; padding: 8px; box-sizing: border-box; }
+  input[type=text] { width: 100%; padding: 8px; box-sizing: border-box; margin-bottom: 8px; }
+  button { padding: 8px 16px; cursor: pointer; }
+  .result { border: 1px solid #ccc; border-radius: 8px; padding: 12px 16px; margin-top: 16px; }
+  .label { font-weight: bold; font-size: 16px; }
+  .likely_ai { color: #b02a2a; }
+  .likely_human { color: #1a7a3a; }
+  .uncertain { color: #a06a00; }
+  .meta { color: #555; font-size: 13px; }
+  .history-item { border-bottom: 1px solid #eee; padding: 8px 0; font-size: 13px; }
+  .error { color: #b02a2a; }
+  .appeal-box { margin-top: 8px; }
+  .appeal-box textarea { height: 60px; }
+  .resolved-flag { color: #1a7a3a; font-weight: bold; }
+</style>
+</head>
+<body>
+  <h1>Provenance Guard</h1>
+  <p>Paste a piece of text below to check its attribution. Ratings shown below reset when you refresh the page.</p>
+
+  <input type="text" id="creatorId" placeholder="creator_id (optional)">
+  <textarea id="text" placeholder="Paste your text here..."></textarea>
+  <br><br>
+  <button id="submitBtn">Submit for analysis</button>
+
+  <div id="result"></div>
+
+  <h2>Previous ratings (this session)</h2>
+  <div id="history"></div>
+
+<script>
+const sessionRatings = [];
+let currentDisplayedId = null;
+
+function appealSectionHtml(r) {
+  if (r.status === 'classified') {
+    return `
+      <button onclick="showAppealForm('${r.content_id}')">Disagree? Appeal this result</button>
+      <div id="appeal-form-${r.content_id}"></div>
+    `;
+  }
+  if (r.status === 'under_review') {
+    return `<em>Appeal submitted — waiting on human review. This updates automatically, no need to refresh.</em>`;
+  }
+  // resolved
+  return `
+    <span class="resolved-flag">Reviewed by a human.</span>
+    ${r.reviewer_notes ? `Reviewer notes: "${r.reviewer_notes}"` : ''}
+  `;
+}
+
+function renderResult(r) {
+  currentDisplayedId = r.content_id;
+  const el = document.getElementById('result');
+  el.innerHTML = `
+    <div class="result">
+      <div class="label ${r.attribution}">${r.label}</div>
+      <div class="meta">
+        attribution: ${r.attribution} | confidence: ${r.confidence} | combined_score: ${r.combined_score}<br>
+        llm_score: ${r.signals.llm_score} (${r.signals.llm_reasoning})<br>
+        style_score: ${r.signals.style_score}
+          (sentence_variance: ${r.signals.style_breakdown.sentence_variance_score},
+           punctuation: ${r.signals.style_breakdown.punctuation_score})<br>
+        content_id: ${r.content_id} | status: ${r.status}
+      </div>
+      <div class="appeal-box" id="appeal-section-${r.content_id}">
+        ${appealSectionHtml(r)}
+      </div>
+    </div>
+  `;
+}
+
+function showAppealForm(contentId) {
+  const el = document.getElementById(`appeal-form-${contentId}`);
+  el.innerHTML = `
+    <textarea id="reasoning-${contentId}" placeholder="Explain why you think this classification is wrong..."></textarea>
+    <br><button onclick="submitAppeal('${contentId}')">Submit appeal</button>
+  `;
+}
+
+async function submitAppeal(contentId) {
+  const reasoning = document.getElementById(`reasoning-${contentId}`).value.trim();
+  if (!reasoning) return;
+  const resp = await fetch('/appeal', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({content_id: contentId, creator_reasoning: reasoning})
+  });
+  const data = await resp.json();
+  const entry = sessionRatings.find(x => x.content_id === contentId);
+  if (entry) entry.status = data.status || entry.status;
+
+  const section = document.getElementById(`appeal-section-${contentId}`);
+  if (section) {
+    section.innerHTML = resp.ok ? appealSectionHtml(entry) : `<em>${data.error}</em>`;
+  }
+  renderHistory();
+}
+
+function renderHistory() {
+  const el = document.getElementById('history');
+  if (sessionRatings.length === 0) { el.innerHTML = '<p class="meta">No submissions yet this session.</p>'; return; }
+  el.innerHTML = sessionRatings.slice().reverse().map(r => `
+    <div class="history-item">
+      <span class="label ${r.attribution}">${r.attribution}</span>
+      — confidence ${r.confidence} — status: ${r.status}${r.status === 'resolved' ? ' <span class="resolved-flag">(updated)</span>' : ''}
+      — "${r.text.slice(0, 60)}${r.text.length > 60 ? '...' : ''}"
+      ${r.reviewer_notes ? `<br><span class="meta">Reviewer notes: "${r.reviewer_notes}"</span>` : ''}
+    </div>
+  `).join('');
+}
+
+// Polling: nothing is persisted server-side per-session, so instead of
+// requiring a page refresh (which would wipe sessionRatings), periodically
+// re-check the status of anything still under_review using the content_id
+// already held in memory from when it was submitted.
+async function pollForUpdates() {
+  const pending = sessionRatings.filter(r => r.status !== 'resolved');
+  for (const entry of pending) {
+    let resp;
+    try {
+      resp = await fetch(`/status/${entry.content_id}`);
+    } catch (e) {
+      continue; // network hiccup, try again next tick
+    }
+    if (!resp.ok) continue;
+    const fresh = await resp.json();
+    if (fresh.status === entry.status) continue;
+
+    entry.status = fresh.status;
+    entry.attribution = fresh.attribution;
+    entry.confidence = fresh.confidence;
+    entry.label = fresh.label;
+    entry.reviewer_notes = fresh.reviewer_notes;
+
+    if (currentDisplayedId === entry.content_id) {
+      renderResult(entry);
+    }
+  }
+  renderHistory();
+}
+
+setInterval(pollForUpdates, 5000);
+
+document.getElementById('submitBtn').addEventListener('click', async () => {
+  const text = document.getElementById('text').value.trim();
+  const creatorId = document.getElementById('creatorId').value.trim();
+  if (!text) return;
+
+  const resp = await fetch('/submit', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text, creator_id: creatorId})
+  });
+
+  if (resp.status === 429) {
+    document.getElementById('result').innerHTML = '<p class="error">Rate limit exceeded. Slow down and try again shortly.</p>';
+    return;
+  }
+
+  const data = await resp.json();
+  if (!resp.ok) {
+    document.getElementById('result').innerHTML = `<p class="error">${data.error}</p>`;
+    return;
+  }
+
+  renderResult(data);
+  sessionRatings.push({...data, text});
+  renderHistory();
+});
+</script>
+</body>
+</html>

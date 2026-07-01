@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Provenance Guard — Review Queue</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 40px auto; color: #222; }
+  .card { border: 1px solid #ccc; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  .text-block { background: #f7f7f7; padding: 10px; border-radius: 6px; white-space: pre-wrap; font-size: 13px; max-height: 160px; overflow-y: auto; }
+  .meta { color: #555; font-size: 13px; margin: 8px 0; }
+  .appeal-reasoning { border-left: 3px solid #a06a00; padding-left: 10px; margin: 8px 0; font-style: italic; }
+  select, textarea, button { font-family: inherit; font-size: 13px; }
+  textarea { width: 100%; height: 50px; box-sizing: border-box; }
+  .empty { color: #777; }
+</style>
+</head>
+<body>
+  <h1>Review Queue</h1>
+  <p class="meta">Submissions with status "under_review" (i.e. appealed by a creator). No auth on this route by design — it's for grading/demo visibility only.</p>
+  <button onclick="loadQueue()">Refresh queue</button>
+  <div id="queue"></div>
+
+<script>
+async function loadQueue() {
+  const resp = await fetch('/queue');
+  const data = await resp.json();
+  const el = document.getElementById('queue');
+  if (data.entries.length === 0) {
+    el.innerHTML = '<p class="empty">No appeals currently pending review.</p>';
+    return;
+  }
+  el.innerHTML = data.entries.map(entry => `
+    <div class="card">
+      <div class="text-block">${entry.text}</div>
+      <div class="meta">
+        content_id: ${entry.content_id} | creator_id: ${entry.creator_id} | submitted: ${entry.timestamp}<br>
+        system attribution: <strong>${entry.attribution}</strong> | confidence: ${entry.confidence} | combined_score: ${entry.combined_score}<br>
+        llm_score: ${entry.llm_score} (${entry.llm_reasoning})<br>
+        style_score: ${entry.style_score}
+          (sentence_variance: ${entry.style_breakdown.sentence_variance_score},
+           punctuation: ${entry.style_breakdown.punctuation_score})
+      </div>
+      <div class="appeal-reasoning">"${entry.appeal_reasoning}"</div>
+      <label>Final decision:
+        <select id="decision-${entry.content_id}">
+          <option value="likely_ai">likely_ai</option>
+          <option value="uncertain">uncertain</option>
+          <option value="likely_human">likely_human</option>
+        </select>
+      </label>
+      <br>
+      <textarea id="notes-${entry.content_id}" placeholder="Reviewer notes..."></textarea>
+      <br>
+      <button onclick="submitDecision('${entry.content_id}')">Resolve appeal</button>
+      <div id="status-${entry.content_id}"></div>
+    </div>
+  `).join('');
+}
+
+async function submitDecision(contentId) {
+  const reviewer_attribution = document.getElementById(`decision-${contentId}`).value;
+  const reviewer_notes = document.getElementById(`notes-${contentId}`).value.trim();
+  const resp = await fetch(`/review/${contentId}/decision`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({reviewer_attribution, reviewer_notes})
+  });
+  const data = await resp.json();
+  document.getElementById(`status-${contentId}`).innerHTML =
+    resp.ok ? `<em>Resolved as ${data.submission.attribution}.</em>` : `<em>${data.error}</em>`;
+  setTimeout(loadQueue, 800);
+}
+
+loadQueue();
+</script>
+</body>
+</html>
